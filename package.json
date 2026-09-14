@@ -1,0 +1,29 @@
+{
+  "name": "tg-s3",
+  "version": "1.0.0",
+  "description": "Telegram S3-compatible object storage powered by GramJS MTProto, SQLite, and Content-Addressable Storage (CAS)",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "login": "tsx scripts/login.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.7",
+    "@mtcute/node": "^0.32.1",
+    "@types/qrcode-terminal": "^0.12.2",
+    "better-sqlite3": "^11.8.1",
+    "dotenv": "^16.4.7",
+    "hono": "^4.6.14",
+    "input": "^1.0.1",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
