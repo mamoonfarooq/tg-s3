@@ -37,16 +37,17 @@ This document records the compatibility status and deliberate design decisions f
 
 ## Server-Side Encryption
 
-- **SSE-C** (Customer-Provided Keys): Full support. Encryption is handled in the standalone Node service. Supported headers include `x-amz-server-side-encryption-customer-algorithm`, `x-amz-server-side-encryption-customer-key`, and `x-amz-server-side-encryption-customer-key-MD5`.
-- **SSE-S3** (Server-Managed Keys): Full support. AES-256-GCM encryption is done with a server-managed key from `SSE_MASTER_KEY`.
+- **SSE-C** (Customer-Provided Keys): Supported for single-part uploads. Requires `x-amz-server-side-encryption-customer-algorithm`, `x-amz-server-side-encryption-customer-key`, and `x-amz-server-side-encryption-customer-key-MD5`. Every GET/HEAD must present the same key: missing key returns 400, wrong key returns 403. The server stores only the key MD5.
+- **SSE-S3** (Server-Managed Keys): Supported for single-part uploads. AES-256-GCM with a server-managed key from `S3_MASTER_KEY` (base64, 32 bytes, set in `.env`). Reads are transparent to clients.
 - **SSE-KMS**: Not implemented.
 
 **Encryption notes:**
-- Encrypted objects skip the local cache because each GET requires the customer key or the server key.
 - ETag remains the MD5 of the plaintext payload, matching standard S3 semantics.
-- CopyObject supports re-encryption using the customer-provided source encryption headers.
-- Multipart parts are temporary and encrypted when the final object is assembled.
-- Image variants such as `?w=`, `?fmt=`, and `?q=` are not available for encrypted objects.
+- Encrypted chunks are cached locally like any other chunk (the cache holds ciphertext; decryption happens at request time).
+- Encrypted objects are not deduplicated (fresh random IV per upload).
+- Multipart uploads are stored unencrypted (SSE headers on multipart operations are ignored).
+- CopyObject preserves the source object's encryption state; passing SSE headers on copy returns `501 NotImplemented`.
+- Losing `S3_MASTER_KEY` (SSE-S3) or the customer key (SSE-C) makes those objects permanently unreadable; they can still be deleted.
 
 ## Authentication
 

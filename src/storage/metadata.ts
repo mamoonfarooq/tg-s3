@@ -48,6 +48,7 @@ export interface MultipartUploadRecord {
   bucket: string;
   key: string;
   content_type: string;
+  system_metadata: string | null;
   created_at: string;
 }
 
@@ -328,8 +329,8 @@ export class MetadataStore {
   static createMultipartUpload(uploadId: string, bucket: string, key: string, contentType: string): MultipartUploadRecord {
     const db = getDb();
     db.prepare(`
-      INSERT INTO multipart_uploads (upload_id, bucket, key, content_type)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO multipart_uploads (upload_id, bucket, key, content_type, system_metadata)
+      VALUES (?, ?, ?, ?, NULL)
     `).run(uploadId, bucket, key, contentType);
 
     return db.prepare('SELECT * FROM multipart_uploads WHERE upload_id = ?').get(uploadId) as MultipartUploadRecord;
@@ -338,6 +339,11 @@ export class MetadataStore {
   static getMultipartUpload(uploadId: string): MultipartUploadRecord | undefined {
     const db = getDb();
     return db.prepare('SELECT * FROM multipart_uploads WHERE upload_id = ?').get(uploadId) as MultipartUploadRecord | undefined;
+  }
+
+  static updateMultipartUploadSystemMetadata(uploadId: string, systemMetadata: string): void {
+    const db = getDb();
+    db.prepare('UPDATE multipart_uploads SET system_metadata = ? WHERE upload_id = ?').run(systemMetadata, uploadId);
   }
 
   static recordMultipartPart(uploadId: string, partNumber: number, etag: string, size: number, casSha256: string): void {
@@ -458,6 +464,16 @@ export class MetadataStore {
     const combinedEtags = parts.map(p => p.etag.replace(/"/g, '')).join('');
     const etag = `"${crypto.createHash('md5').update(combinedEtags).digest('hex')}-${parts.length}"`;
 
+    // Parse system_metadata from multipart upload (if any)
+    let systemMetadata: Record<string, string> | null = null;
+    if (mpUpload.system_metadata) {
+      try {
+        systemMetadata = JSON.parse(mpUpload.system_metadata);
+      } catch {
+        systemMetadata = null;
+      }
+    }
+
     const objectRecord = this.saveObjectWithChunks(
       bucket,
       key,
@@ -466,7 +482,8 @@ export class MetadataStore {
       mpUpload.content_type || 'application/octet-stream',
       null,
       null,
-      chunksToSave
+      chunksToSave,
+      systemMetadata
     );
 
     this.deleteMultipartUpload(uploadId);

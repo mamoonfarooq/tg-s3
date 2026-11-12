@@ -11,6 +11,10 @@ import {
 } from '../xml/builder.js';
 import { parseCompleteMultipart } from '../xml/parser.js';
 import { S3_MAX_KEYS_DEFAULT, S3_MAX_PART_NUMBER } from '../constants.js';
+import {
+  parseSseCHeaders, validateKeyMd5, encrypt, decrypt,
+  addSseMetadata, addSseS3Metadata, SseCError, SseCParams
+} from '../utils/sse.js';
 
 function clampInt(val: string | null, defaultVal: number, min: number, max: number): number {
   const n = parseInt(val || String(defaultVal), 10);
@@ -59,6 +63,64 @@ export async function handleUploadPart(s3: S3Request): Promise<Response> {
     return errorResponse(404, 'NoSuchUpload', 'The specified multipart upload does not exist.');
   }
 
+  // SSE resolution: optional per-request encryption (SSE-C or SSE-S3)
+  let sseParams: SseCParams | null = null;
+  let useSseS3 = false;
+  try {
+    sseParams = parseSseCHeaders(s3.headers);
+    if (sseParams) await validateKeyMd5(sseParams);
+  } catch (e) {
+    if (e instanceof SseCError) return errorResponse(400, 'InvalidArgument', e.message);
+    throw e;
+  }
+
+  const sseS3Header = s3.headers.get('x-amz-server-side-encryption');
+  if (sseParams && sseS3Header) {
+    return errorResponse(400, 'InvalidRequest', 'SSE-C and x-amz-server-side-encryption cannot both be specified.');
+  }
+  if (!sseParams && sseS3Header) {
+    if (sseS3Header.toUpperCase() !== 'AES256') {
+      return errorResponse(400, 'InvalidArgument', `The value '${sseS3Header}' for x-amz-server-side-encryption is not valid. Supported value: AES256.`);
+    }
+    if (!process.env.S3_MASTER_KEY) {
+      return errorResponse(400, 'InvalidRequest', 'Server-side encryption (SSE-S3) is not configured. Set S3_MASTER_KEY in the environment.');
+    }
+    useSseS3 = true;
+  }
+
+  // If upload already has encryption metadata, verify consistency with this part
+  if (upload.system_metadata) {
+    try {
+      const uploadMeta = JSON.parse(upload.system_metadata);
+      if (sseParams) {
+        // Existing upload is encrypted - check algorithm and key-md5 match
+        if (uploadMeta._sse !== 'AES256' || uploadMeta._sse_key_md5 !== sseParams.keyMd5) {
+          return errorResponse(400, 'InvalidArgument', 'Part upload encryption settings do not match the multipart upload encryption settings.');
+        }
+      } else if (useSseS3) {
+        if (uploadMeta._sse_s3 !== 'AES256') {
+          return errorResponse(400, 'InvalidArgument', 'Part upload encryption settings do not match the multipart upload encryption settings.');
+        }
+      } else {
+        // Upload is encrypted but this part is not
+        return errorResponse(400, 'InvalidArgument', 'Part upload must provide matching encryption settings.');
+      }
+    } catch { /* ignore */ }
+  } else {
+    // Upload is not yet encrypted - if this part is encrypted, it sets the encryption for all parts
+    if (!sseParams && !useSseS3) {
+      // No encryption - verify no parts have been uploaded with encryption
+      const existingParts = MetadataStore.listParts(uploadId);
+      if (existingParts.length > 0) {
+        // All parts must use the same encryption, check if any part's upload has encryption
+        const uploadCheck = MetadataStore.getMultipartUpload(uploadId);
+        if (uploadCheck?.system_metadata) {
+          return errorResponse(400, 'InvalidArgument', 'Cannot mix encrypted and unencrypted parts in a multipart upload.');
+        }
+      }
+    }
+  }
+
   // Write incoming stream to temp file
   const tempFileName = `part_${uploadId}_${partNumber}_${Date.now()}.tmp`;
   const tempPath = CacheManager.getTempPath(tempFileName);
@@ -87,6 +149,26 @@ export async function handleUploadPart(s3: S3Request): Promise<Response> {
     });
   });
 
+  // Encrypt the part before chunking if SSE is enabled
+  let systemMetaForUpload: Record<string, string> = {};
+  if (sseParams) {
+    const plaintext = fs.readFileSync(tempPath);
+    const encrypted = await encrypt(
+      plaintext.buffer.slice(plaintext.byteOffset, plaintext.byteOffset + plaintext.byteLength) as ArrayBuffer,
+      sseParams.keyBase64
+    );
+    fs.writeFileSync(tempPath, Buffer.from(encrypted));
+    systemMetaForUpload = addSseMetadata(systemMetaForUpload, sseParams);
+  } else if (useSseS3) {
+    const plaintext = fs.readFileSync(tempPath);
+    const encrypted = await encrypt(
+      plaintext.buffer.slice(plaintext.byteOffset, plaintext.byteOffset + plaintext.byteLength) as ArrayBuffer,
+      process.env.S3_MASTER_KEY!
+    );
+    fs.writeFileSync(tempPath, Buffer.from(encrypted));
+    systemMetaForUpload = addSseS3Metadata(systemMetaForUpload);
+  }
+
   const etag = `"${md5Hash.digest('hex')}"`;
 
   try {
@@ -99,12 +181,27 @@ export async function handleUploadPart(s3: S3Request): Promise<Response> {
       casSha256: JSON.stringify(casChunks),
     });
 
+    // Set encryption metadata on the upload (only once, for the first encrypted part)
+    if (Object.keys(systemMetaForUpload).length > 0 && !upload.system_metadata) {
+      MetadataStore.updateMultipartUploadSystemMetadata(uploadId, JSON.stringify(systemMetaForUpload));
+    }
+
+    // Build SSE response headers
+    const responseHeaders: Record<string, string> = {
+      'ETag': etag,
+      'x-amz-request-id': crypto.randomUUID(),
+    };
+
+    if (sseParams) {
+      responseHeaders['x-amz-server-side-encryption-customer-algorithm'] = 'AES256';
+      responseHeaders['x-amz-server-side-encryption-customer-key-MD5'] = sseParams.keyMd5;
+    } else if (useSseS3) {
+      responseHeaders['x-amz-server-side-encryption'] = 'AES256';
+    }
+
     return new Response(null, {
       status: 200,
-      headers: {
-        'ETag': etag,
-        'x-amz-request-id': crypto.randomUUID(),
-      },
+      headers: responseHeaders,
     });
   } finally {
     if (fs.existsSync(tempPath)) {
@@ -140,7 +237,30 @@ export async function handleCompleteMultipartUpload(s3: S3Request): Promise<Resp
 
   const objectRecord = MetadataStore.completeMultipartUpload(uploadId, s3.bucket, s3.key, requestParts);
 
-  return xmlResponse(completeMultipartXml(s3.bucket, s3.key, objectRecord.etag));
+  // Build response with potential SSE headers
+  const xmlBody = completeMultipartXml(s3.bucket, s3.key, objectRecord.etag);
+  const responseHeaders: Record<string, string> = {
+    'Content-Type': 'application/xml',
+    'x-amz-request-id': crypto.randomUUID(),
+  };
+
+  // Add SSE response headers if the object is encrypted
+  if (objectRecord.system_metadata) {
+    try {
+      const systemMeta = JSON.parse(objectRecord.system_metadata);
+      if (systemMeta._sse === 'AES256') {
+        responseHeaders['x-amz-server-side-encryption-customer-algorithm'] = 'AES256';
+        responseHeaders['x-amz-server-side-encryption-customer-key-MD5'] = systemMeta._sse_key_md5;
+      } else if (systemMeta._sse_s3 === 'AES256') {
+        responseHeaders['x-amz-server-side-encryption'] = 'AES256';
+      }
+    } catch { /* ignore */ }
+  }
+
+  return new Response(xmlBody, {
+    status: 200,
+    headers: responseHeaders,
+  });
 }
 
 export async function handleAbortMultipartUpload(s3: S3Request): Promise<Response> {
@@ -166,7 +286,29 @@ export async function handleListParts(s3: S3Request): Promise<Response> {
   }
 
   const parts = MetadataStore.listParts(uploadId);
-  return xmlResponse(listPartsXml(s3.bucket, s3.key, uploadId, parts));
+  const xmlBody = listPartsXml(s3.bucket, s3.key, uploadId, parts);
+  const responseHeaders: Record<string, string> = {
+    'Content-Type': 'application/xml',
+    'x-amz-request-id': crypto.randomUUID(),
+  };
+
+  // Add SSE response headers if the upload is encrypted
+  if (upload.system_metadata) {
+    try {
+      const systemMeta = JSON.parse(upload.system_metadata);
+      if (systemMeta._sse === 'AES256') {
+        responseHeaders['x-amz-server-side-encryption-customer-algorithm'] = 'AES256';
+        responseHeaders['x-amz-server-side-encryption-customer-key-MD5'] = systemMeta._sse_key_md5;
+      } else if (systemMeta._sse_s3 === 'AES256') {
+        responseHeaders['x-amz-server-side-encryption'] = 'AES256';
+      }
+    } catch { /* ignore */ }
+  }
+
+  return new Response(xmlBody, {
+    status: 200,
+    headers: responseHeaders,
+  });
 }
 
 export async function handleListMultipartUploads(s3: S3Request): Promise<Response> {

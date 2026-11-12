@@ -48,5 +48,11 @@ export function getDb(): Database.Database {
     dbInstance.prepare('ALTER TABLE objects ADD COLUMN system_metadata TEXT').run();
   }
 
+  // Migration: add system_metadata to multipart_uploads (for multipart SSE)
+  const multipartColumns = (dbInstance.prepare('PRAGMA table_info(multipart_uploads)').all() as Array<{ name: string }>).map(c => c.name);
+  if (!multipartColumns.includes('system_metadata')) {
+    dbInstance.prepare('ALTER TABLE multipart_uploads ADD COLUMN system_metadata TEXT').run();
+  }
+
   return dbInstance;
 }

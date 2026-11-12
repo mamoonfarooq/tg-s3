@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     bucket              TEXT NOT NULL,
     key                 TEXT NOT NULL,
     content_type        TEXT,
+    system_metadata     TEXT,
     created_at          TEXT NOT NULL DEFAULT (DATETIME('now')),
     FOREIGN KEY (bucket) REFERENCES buckets(name) ON DELETE CASCADE
 );
