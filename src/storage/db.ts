@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
+import { SCHEMA_SQL } from './schema.js';
 
 let dbInstance: Database.Database | null = null;
 
@@ -25,14 +26,26 @@ export function getDb(): Database.Database {
   dbInstance.pragma('cache_size = -64000');
   dbInstance.pragma('temp_store = MEMORY');
 
-  // Auto-init schema if table doesn't exist
-  const tableCheck = dbInstance.prepare("SELECT count(*) as count FROM sqlite_master WHERE type='table' AND name='buckets'").get() as { count: number };
+  // Initialize schema. Embedded in the build so it works no matter where the
+  // process runs from; every statement is IF NOT EXISTS, so existing databases
+  // are left untouched.
+  dbInstance.exec(SCHEMA_SQL);
+
+  // Fail loudly if initialization did not produce the schema
+  const tableCheck = dbInstance.prepare(
+    "SELECT count(*) as count FROM sqlite_master WHERE type='table' AND name='buckets'"
+  ).get() as { count: number };
   if (tableCheck.count === 0) {
-    const schemaPath = path.join(process.cwd(), 'src', 'storage', 'schema.sql');
-    if (fs.existsSync(schemaPath)) {
-      const schemaSql = fs.readFileSync(schemaPath, 'utf8');
-      dbInstance.exec(schemaSql);
-    }
+    throw new Error(
+      `Database schema initialization failed for ${dbPath}. ` +
+      'The server cannot start without a valid metadata store.'
+    );
+  }
+
+  // Lightweight column migration for databases created before SSE support
+  const objectColumns = (dbInstance.prepare('PRAGMA table_info(objects)').all() as Array<{ name: string }>).map(c => c.name);
+  if (!objectColumns.includes('system_metadata')) {
+    dbInstance.prepare('ALTER TABLE objects ADD COLUMN system_metadata TEXT').run();
   }
 
   return dbInstance;

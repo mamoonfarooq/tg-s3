@@ -6,7 +6,7 @@ import { CacheManager } from '../storage/cache.js';
 import { CasEngine } from '../storage/cas.js';
 import { extractUserMetadata } from '../utils/headers.js';
 import { errorResponse } from '../xml/builder.js';
-import { parseSseCHeaders, validateKeyMd5, SseCError } from '../utils/sse.js';
+import { parseSseCHeaders, validateKeyMd5, encrypt, addSseMetadata, addSseS3Metadata, SseCError, SseCParams } from '../utils/sse.js';
 
 function parseTaggingHeader(header: string | null): { key: string; value: string }[] | null {
   if (!header) return null;
@@ -21,14 +21,30 @@ export async function handlePutObject(s3: S3Request): Promise<Response> {
   const bucket = MetadataStore.getBucket(s3.bucket);
   if (!bucket) return errorResponse(404, 'NoSuchBucket', 'The specified bucket does not exist.', s3.bucket);
 
-  // SSE-C check
-  let sseParams: ReturnType<typeof parseSseCHeaders> = null;
+  // SSE resolution: optional per-request encryption (SSE-C with a customer
+  // key, or SSE-S3 with the server master key). Plain request = no encryption.
+  let sseParams: SseCParams | null = null;
+  let useSseS3 = false;
   try {
     sseParams = parseSseCHeaders(s3.headers);
     if (sseParams) await validateKeyMd5(sseParams);
   } catch (e) {
     if (e instanceof SseCError) return errorResponse(400, 'InvalidArgument', e.message);
     throw e;
+  }
+
+  const sseS3Header = s3.headers.get('x-amz-server-side-encryption');
+  if (sseParams && sseS3Header) {
+    return errorResponse(400, 'InvalidRequest', 'SSE-C and x-amz-server-side-encryption cannot both be specified.');
+  }
+  if (!sseParams && sseS3Header) {
+    if (sseS3Header.toUpperCase() !== 'AES256') {
+      return errorResponse(400, 'InvalidArgument', `The value '${sseS3Header}' for x-amz-server-side-encryption is not valid. Supported value: AES256.`);
+    }
+    if (!process.env.S3_MASTER_KEY) {
+      return errorResponse(400, 'InvalidRequest', 'Server-side encryption (SSE-S3) is not configured. Set S3_MASTER_KEY in the environment.');
+    }
+    useSseS3 = true;
   }
 
   const contentType = s3.headers.get('content-type') || 'application/octet-stream';
@@ -94,6 +110,28 @@ export async function handlePutObject(s3: S3Request): Promise<Response> {
   }
 
   try {
+    // Server-side encryption (optional): encrypt the whole object before
+    // chunking. ETag/sha256 stay over the plaintext for client-side checks;
+    // Telegram and the local cache only ever see ciphertext.
+    let systemMeta: Record<string, string> = {};
+    if (sseParams) {
+      const plaintext = fs.readFileSync(tempPath);
+      const encrypted = await encrypt(
+        plaintext.buffer.slice(plaintext.byteOffset, plaintext.byteOffset + plaintext.byteLength) as ArrayBuffer,
+        sseParams.keyBase64
+      );
+      fs.writeFileSync(tempPath, Buffer.from(encrypted));
+      systemMeta = addSseMetadata(systemMeta, sseParams);
+    } else if (useSseS3) {
+      const plaintext = fs.readFileSync(tempPath);
+      const encrypted = await encrypt(
+        plaintext.buffer.slice(plaintext.byteOffset, plaintext.byteOffset + plaintext.byteLength) as ArrayBuffer,
+        process.env.S3_MASTER_KEY!
+      );
+      fs.writeFileSync(tempPath, Buffer.from(encrypted));
+      systemMeta = addSseS3Metadata(systemMeta);
+    }
+
     // Process temp file into CAS chunks & upload to Telegram if chunk is new
     const casChunks = await CasEngine.storeFile(tempPath);
 
@@ -106,15 +144,24 @@ export async function handlePutObject(s3: S3Request): Promise<Response> {
       contentType,
       sha256HexStr,
       userMeta,
-      casChunks
+      casChunks,
+      Object.keys(systemMeta).length > 0 ? systemMeta : null
     );
+
+    const responseHeaders: Record<string, string> = {
+      'ETag': etag,
+      'x-amz-request-id': crypto.randomUUID(),
+    };
+    if (sseParams) {
+      responseHeaders['x-amz-server-side-encryption-customer-algorithm'] = 'AES256';
+      responseHeaders['x-amz-server-side-encryption-customer-key-MD5'] = sseParams.keyMd5;
+    } else if (useSseS3) {
+      responseHeaders['x-amz-server-side-encryption'] = 'AES256';
+    }
 
     return new Response(null, {
       status: 200,
-      headers: {
-        'ETag': etag,
-        'x-amz-request-id': crypto.randomUUID(),
-      },
+      headers: responseHeaders,
     });
   } finally {
     if (fs.existsSync(tempPath)) {

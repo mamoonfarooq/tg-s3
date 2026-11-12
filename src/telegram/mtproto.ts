@@ -57,7 +57,7 @@ export async function uploadChunkToTelegram(
 
   const targetGroup = parseInt(groupId, 10) || groupId;
 
-  const message = await client.sendMedia(targetGroup, InputMedia.document(filePath, {
+  const message = await client.sendMedia(targetGroup, InputMedia.document(`file:${path.resolve(filePath)}`, {
     caption: `TG-S3 Chunk: ${filename}`,
   }));
 
@@ -103,6 +103,21 @@ export async function downloadChunkFromTelegram(
   }
 
   await client.downloadToFile(destPath, message.media! as any);
+}
+
+/**
+ * Delete a chunk message from the target Telegram supergroup/channel.
+ */
+export async function deleteChunkFromTelegram(tgMsgId: number): Promise<void> {
+  const client = await getTelegramClient();
+  const { groupId } = getAppCredentials();
+
+  if (!groupId) {
+    throw new Error('TG_GROUP_ID must be set in environment variables');
+  }
+
+  const targetGroup = parseInt(groupId, 10) || groupId;
+  await client.deleteMessagesById(targetGroup, [tgMsgId], { revoke: true });
 }
 
 export const MTProtoManager = {

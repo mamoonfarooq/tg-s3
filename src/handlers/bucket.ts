@@ -12,6 +12,9 @@ export async function handleBucketOps(s3: S3Request): Promise<Response> {
     return new Response(null, { status: 200 });
   }
   if (method === 'GET') {
+    if (!s3.bucket) {
+      return handleListBuckets(s3);
+    }
     const { handleListObjects } = await import('./list-objects.js');
     return handleListObjects(s3);
   }
@@ -39,7 +42,10 @@ export async function handleCreateBucket(s3: S3Request): Promise<Response> {
     return errorResponse(400, 'InvalidBucketName', 'The specified bucket is not valid.');
   }
 
-  MetadataStore.createBucket(s3.bucket);
+  const created = MetadataStore.createBucket(s3.bucket);
+  if (!created) {
+    return errorResponse(500, 'InternalError', 'Failed to create bucket.', s3.bucket);
+  }
   return new Response(null, { status: 200, headers: { 'Location': `/${s3.bucket}` } });
 }
 

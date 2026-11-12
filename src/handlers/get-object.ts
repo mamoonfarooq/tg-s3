@@ -3,6 +3,7 @@ import { MetadataStore } from '../storage/metadata.js';
 import { CasEngine } from '../storage/cas.js';
 import { parseRange } from '../utils/headers.js';
 import { errorResponse } from '../xml/builder.js';
+import { parseSseCHeaders, validateKeyMd5, decrypt, decryptS3, isEncrypted, isEncryptedS3, getStoredKeyMd5, addSseResponseHeaders, addSseS3ResponseHeaders, SseCError } from '../utils/sse.js';
 import crypto from 'crypto';
 
 export async function handleGetObject(s3: S3Request): Promise<Response> {
@@ -37,6 +38,53 @@ export async function handleGetObject(s3: S3Request): Promise<Response> {
     return errorResponse(500, 'InternalError', err.message || 'Failed to read object data.');
   }
 
+  // Server-side encryption: SSE-S3 is transparent (server key from env);
+  // SSE-C requires the customer key on every read, like real S3.
+  if (isEncrypted(obj.system_metadata)) {
+    let sseParams;
+    try {
+      sseParams = parseSseCHeaders(s3.headers);
+    } catch (e) {
+      if (e instanceof SseCError) return errorResponse(400, 'InvalidArgument', e.message);
+      throw e;
+    }
+    if (!sseParams) {
+      return errorResponse(400, 'InvalidRequest', 'The object was stored using a customer-provided encryption key. Provide x-amz-server-side-encryption-customer-* headers to read it.');
+    }
+    try {
+      await validateKeyMd5(sseParams);
+    } catch (e) {
+      if (e instanceof SseCError) return errorResponse(400, 'InvalidArgument', e.message);
+      throw e;
+    }
+    if (sseParams.keyMd5 !== getStoredKeyMd5(obj.system_metadata)) {
+      return errorResponse(403, 'AccessDenied', 'The encryption key provided does not match the key used to store this object.');
+    }
+    try {
+      const plain = await decrypt(
+        fileBuffer.buffer.slice(fileBuffer.byteOffset, fileBuffer.byteOffset + fileBuffer.byteLength) as ArrayBuffer,
+        sseParams.keyBase64
+      );
+      fileBuffer = Buffer.from(plain);
+    } catch (err: any) {
+      if (err instanceof SseCError) return errorResponse(403, 'AccessDenied', err.message);
+      return errorResponse(500, 'InternalError', 'Failed to decrypt object data.');
+    }
+  } else if (isEncryptedS3(obj.system_metadata)) {
+    if (!process.env.S3_MASTER_KEY) {
+      return errorResponse(500, 'InternalError', 'Object is SSE-S3 encrypted but S3_MASTER_KEY is not configured.');
+    }
+    try {
+      const plain = await decryptS3(
+        fileBuffer.buffer.slice(fileBuffer.byteOffset, fileBuffer.byteOffset + fileBuffer.byteLength) as ArrayBuffer,
+        process.env.S3_MASTER_KEY
+      );
+      fileBuffer = Buffer.from(plain);
+    } catch {
+      return errorResponse(500, 'InternalError', 'Failed to decrypt object data. Check S3_MASTER_KEY.');
+    }
+  }
+
   const totalSize = fileBuffer.length;
   const rangeHeader = s3.headers.get('range');
 
@@ -47,6 +95,8 @@ export async function handleGetObject(s3: S3Request): Promise<Response> {
     'Accept-Ranges': 'bytes',
     'x-amz-request-id': crypto.randomUUID(),
   };
+  addSseResponseHeaders(headers, obj.system_metadata);
+  addSseS3ResponseHeaders(headers, obj.system_metadata);
 
   // Add custom user metadata
   if (obj.custom_metadata) {

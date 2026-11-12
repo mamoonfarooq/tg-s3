@@ -20,6 +20,7 @@ export interface ObjectRecord {
   last_modified: string;
   storage_class: string;
   custom_metadata: string | null;
+  system_metadata: string | null;
   sha256_hash: string | null;
   access_count: number;
   last_accessed: string | null;
@@ -77,7 +78,7 @@ export class MetadataStore {
       db.prepare('INSERT INTO buckets (name, is_public, default_encryption) VALUES (?, ?, ?)').run(
         name,
         isPublic,
-        defaultEncryption
+        defaultEncryption ?? 0
       );
       return true;
     } catch {
@@ -224,7 +225,8 @@ export class MetadataStore {
     contentType: string,
     sha256Hash: string | null,
     customMetadata: Record<string, string> | null,
-    chunks: Array<{ casSha256: string; size: number }>
+    chunks: Array<{ casSha256: string; size: number }>,
+    systemMetadata: Record<string, string> | null = null
   ): ObjectRecord {
     const db = getDb();
 
@@ -235,11 +237,12 @@ export class MetadataStore {
       }
 
       const metadataStr = customMetadata ? JSON.stringify(customMetadata) : null;
+      const systemMetadataStr = systemMetadata ? JSON.stringify(systemMetadata) : null;
 
       const res = db.prepare(`
-        INSERT INTO objects (bucket, key, size, etag, content_type, custom_metadata)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run(bucket, key, size, etag, contentType, metadataStr);
+        INSERT INTO objects (bucket, key, size, etag, content_type, custom_metadata, system_metadata)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(bucket, key, size, etag, contentType, metadataStr, systemMetadataStr);
 
       const objectId = res.lastInsertRowid;
 

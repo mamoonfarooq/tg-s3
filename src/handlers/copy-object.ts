@@ -3,6 +3,7 @@ import type { S3Request } from '../types.js';
 import { MetadataStore } from '../storage/metadata.js';
 import { extractUserMetadata } from '../utils/headers.js';
 import { etagMatches } from '../utils/headers.js';
+import { SSE_HEADERS } from '../utils/sse.js';
 import { copyObjectXml, xmlResponse, errorResponse } from '../xml/builder.js';
 
 export async function handleCopyObject(s3: S3Request): Promise<Response> {
@@ -79,8 +80,15 @@ export async function handleCopyObject(s3: S3Request): Promise<Response> {
     }
   }
 
+  // Copies share the source's chunks, so re-encryption with a new key would
+  // require reading and re-chunking the object. Reject explicit SSE requests
+  // instead of silently leaving the copy unencrypted; the source's own
+  // encryption state is preserved automatically.
+  if (s3.headers.has('x-amz-server-side-encryption') || s3.headers.has(SSE_HEADERS.algorithm)) {
+    return errorResponse(501, 'NotImplemented', 'Encryption-header changes are not supported on copy. The copy inherits the source object\'s encryption state.');
+  }
+
   const chunks = MetadataStore.getObjectChunks(srcBucket, srcKey);
-  const systemMetadata = srcObj.custom_metadata ? JSON.parse(srcObj.custom_metadata) : undefined;
   const lastModified = new Date().toISOString();
 
   MetadataStore.saveObjectWithChunks(
@@ -90,8 +98,9 @@ export async function handleCopyObject(s3: S3Request): Promise<Response> {
     srcObj.etag,
     contentType,
     null,
-    customMetadata || systemMetadata || null,
-    chunks
+    customMetadata || null,
+    chunks,
+    srcObj.system_metadata ? JSON.parse(srcObj.system_metadata) : null
   );
 
   return xmlResponse(copyObjectXml(srcObj.etag, lastModified));

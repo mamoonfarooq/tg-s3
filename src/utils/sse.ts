@@ -1,4 +1,4 @@
-import { webcrypto } from 'node:crypto';
+import { webcrypto, createHash } from 'node:crypto';
 
 /**
  * SSE-C (Server-Side Encryption with Customer-Provided Keys) utilities.
@@ -62,9 +62,7 @@ export function parseSseCHeaders(headers: Headers, prefix = SSE_HEADERS): SseCPa
 
 /** Validate that the provided SSE-C key-MD5 matches the actual key. */
 export async function validateKeyMd5(params: SseCParams): Promise<void> {
-  const keyBytes = Uint8Array.from(atob(params.keyBase64), c => c.charCodeAt(0));
-  const digest = await crypto.subtle.digest('MD5', keyBytes);
-  const actualMd5 = btoa(String.fromCharCode(...new Uint8Array(digest)));
+  const actualMd5 = createHash('md5').update(Buffer.from(params.keyBase64, 'base64')).digest('base64');
   if (actualMd5 !== params.keyMd5) {
     throw new SseCError('The SSE-C key MD5 does not match the provided key.');
   }

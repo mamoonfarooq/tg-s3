@@ -1,14 +1,34 @@
 import type { S3Request } from '../types.js';
 import { MetadataStore } from '../storage/metadata.js';
+import { cache } from '../storage/cache.js';
+import { deleteChunkFromTelegram } from '../telegram/mtproto.js';
 import { errorResponse, deleteObjectsXml, xmlResponse } from '../xml/builder.js';
 import { parseDeleteObjects } from '../xml/parser.js';
 import crypto from 'crypto';
+
+// Remove the Telegram message, local cache file, and CAS row of chunks
+// that are no longer referenced by any object.
+async function cleanupUnreferencedChunks(hashes: string[]): Promise<void> {
+  for (const sha of hashes) {
+    try {
+      const cas = MetadataStore.getCasChunk(sha);
+      if (cas?.tg_msg_id) {
+        await deleteChunkFromTelegram(cas.tg_msg_id);
+      }
+      cache.removeCacheChunk(sha);
+      MetadataStore.deleteCasChunk(sha);
+    } catch (err: any) {
+      console.error(`Failed to cleanup unreferenced CAS chunk ${sha.slice(0, 8)}...:`, err.message || err);
+    }
+  }
+}
 
 export async function handleDeleteObject(s3: S3Request): Promise<Response> {
   const bucket = MetadataStore.getBucket(s3.bucket);
   if (!bucket) return errorResponse(404, 'NoSuchBucket', 'The specified bucket does not exist.', s3.bucket);
 
-  MetadataStore.deleteObject(s3.bucket, s3.key);
+  const { unreferencedCasHashes } = MetadataStore.deleteObject(s3.bucket, s3.key);
+  await cleanupUnreferencedChunks(unreferencedCasHashes);
   return new Response(null, { status: 204 });
 }
 
@@ -47,7 +67,8 @@ export async function handleDeleteObjects(s3: S3Request): Promise<Response> {
 
   for (const key of keys) {
     try {
-      MetadataStore.deleteObject(s3.bucket, key);
+      const { unreferencedCasHashes } = MetadataStore.deleteObject(s3.bucket, key);
+      await cleanupUnreferencedChunks(unreferencedCasHashes);
       deleted.push(key);
     } catch (e: any) {
       errors.push({ key, code: 'InternalError', message: e.message || 'Failed to delete object.' });

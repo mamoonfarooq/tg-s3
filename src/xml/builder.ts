@@ -130,10 +130,11 @@ export function generateS3Error(
   message?: string,
   requestId?: string
 ): Response {
-  const statusCode = code === 'AccessDenied' || code === 'InvalidAccessKeyId' ? 403
+  const statusCode = code === 'AccessDenied' || code === 'InvalidAccessKeyId' || code === 'SignatureDoesNotMatch' || code === 'RequestTimeTooSkewed' ? 403
     : code === 'NoSuchBucket' || code === 'NoSuchKey' ? 404
     : code === 'BucketNotEmpty' ? 409
-    : code === 'InvalidBucketName' || code === 'InvalidRequest' ? 400
+    : code === 'InvalidBucketName' || code === 'InvalidRequest' || code === 'InvalidArgument' ? 400
+    : code === 'MethodNotAllowed' ? 405
     : 500;
   return errorResponse(statusCode, code, message || String(code), resource);
 }
